@@ -1,6 +1,9 @@
 import logging
+import os
+import sys
 import warnings
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import chain
 from pathlib import Path
 
@@ -40,14 +43,72 @@ from .media_utils import _get_all_valid_media_file_relpaths
 
 logger = logging.getLogger(__name__)
 
+# Windows caps ProcessPoolExecutor at 61 workers.
+_MAX_WORKERS = 61 if sys.platform == "win32" else os.cpu_count() or 1
+
+
+def _cap_workers(workers: int) -> int:
+    """Cap workers to the platform limit."""
+    return min(workers, _MAX_WORKERS)
+
+
+def _process_md_file_for_connect(
+    dirpath: Path,
+    relpath: Path,
+    note: str,
+    show_nested_tags: bool,
+    exclude_canvas: bool,
+) -> dict:
+    """Process a single md file for connect (pure, picklable)."""
+    front_matter, content = _get_md_front_matter_and_content(dirpath / relpath)
+    html = _get_html_from_md_content(content)
+    src_txt = get_source_text_from_html(html, remove_code=True)
+
+    return {
+        "note": note,
+        "md_links": _get_md_links_from_source_text(src_txt),
+        "unique_md_links": _get_unique_md_links_from_source_text(src_txt),
+        "embedded_files": _get_all_embedded_files_from_source_text(
+            src_txt, remove_aliases=True
+        ),
+        "wikilinks": _get_all_wikilinks_from_source_text(
+            src_txt, remove_aliases=True, exclude_canvas=exclude_canvas
+        ),
+        "unique_wikilinks": _get_unique_wikilinks_from_source_text(
+            src_txt, remove_aliases=True, exclude_canvas=exclude_canvas
+        ),
+        "math": _get_all_latex_from_html_content(html),
+        "front_matter": front_matter,
+        "tags": get_tags(dirpath / relpath, show_nested=show_nested_tags),
+    }
+
+
+def _process_md_file_for_gather(
+    dirpath: Path,
+    relpath: Path,
+    note: str,
+    tags: list[str],
+) -> dict:
+    """Process a single md file for gather (pure, picklable)."""
+    _, content = _get_md_front_matter_and_content(dirpath / relpath)
+    html = _get_html_from_md_content(content)
+    src_txt = get_source_text_from_html(html, remove_code=True, remove_math=True)
+
+    return {
+        "note": note,
+        "source_text": src_txt,
+        "readable_text": _get_readable_text_from_html(html, tags=tags),
+    }
+
 
 class Vault:
     def __init__(
         self,
         dirpath: Path,
         *,
-        include_subdirs: list[str] = None,
+        include_subdirs: list[str] | None = None,
         include_root: bool = True,
+        workers: int | None = None,
     ):
         """A Vault object lets you dig into your Obsidian vault, by giving
         you a toolkit for analysing its contents.  Specify a dirpath to
@@ -86,6 +147,12 @@ class Vault:
                 Defaults to None.
             include_root (bool, optional): include files that are directly in
                 the dir_path (root dir).  Defaults to True.
+            workers (int, optional): default number of threads to use for
+                parallel file processing in connect() and gather().
+                Defaults to None (sequential processing).  Set to a
+                positive integer to enable threading, e.g.
+                ``workers=os.cpu_count()``.  Can be overridden per-call
+                by passing workers to connect() or gather() directly.
 
         -- METHODS --
         Methods for setup:
@@ -153,6 +220,7 @@ class Vault:
 
         # args:
         self._dirpath = dirpath
+        self._workers = workers
         self._attachments = None  # connect()
 
         logger.info("Initialising vault from '%s'", dirpath)
@@ -483,15 +551,19 @@ class Vault:
         return self._canvas_graph_detail_index
 
     @canvas_graph_detail_index.setter
-    def canvas_graph_detail_index(
-        self, value
-    ) -> dict[
+    def canvas_graph_detail_index(self, value) -> dict[
         str,
         tuple[nx.MultiDiGraph, dict[str, tuple[int, int]], dict[tuple[str, str], str]],
     ]:
         self._canvas_graph_detail_index = value
 
-    def connect(self, *, show_nested_tags: bool = False, attachments=False):
+    def connect(
+        self,
+        *,
+        show_nested_tags: bool = False,
+        attachments=False,
+        workers: int = None,
+    ):
         """connect your notes together by representing the vault as a
         Networkx graph object, G.
 
@@ -512,13 +584,19 @@ class Vault:
                 To include media files in the graph, set this option to True.
                 This will lead to the inclusion of media files' in the
                 backlinks_index.
+            workers (int, optional): number of threads to use for parallel
+                file processing.  Defaults to None, which uses the value
+                set at Vault initialisation.  Set to a positive integer
+                to override, e.g. ``workers=os.cpu_count()``.
         """
         if not self._is_connected:
             self._attachments = attachments
+            workers = workers if workers is not None else self._workers
             logger.info(
-                "Connecting vault (%d md files, attachments=%s)",
+                "Connecting vault (%d md files, attachments=%s, workers=%s)",
                 len(self._md_file_index),
                 attachments,
+                workers,
             )
 
             # md content:
@@ -536,19 +614,57 @@ class Vault:
             # loop through md files:
             n_md = len(self._md_file_index)
             skipped_md = []
-            for i, (f, relpath) in enumerate(self._md_file_index.items(), 1):
-                logger.debug("connect: processing md file %d/%d: %s", i, n_md, relpath)
-                try:
-                    self._connect_update_based_on_new_relpath(
-                        relpath, note=f, show_nested_tags=show_nested_tags
+
+            exclude_canvas = not self._attachments
+
+            if workers and workers > 1:
+                # parallel processing via process pool:
+                with ProcessPoolExecutor(max_workers=_cap_workers(workers)) as executor:
+                    futures = {
+                        executor.submit(
+                            _process_md_file_for_connect,
+                            self._dirpath,
+                            relpath,
+                            f,
+                            show_nested_tags,
+                            exclude_canvas,
+                        ): (f, relpath)
+                        for f, relpath in self._md_file_index.items()
+                    }
+                    for future in as_completed(futures):
+                        f, relpath = futures[future]
+                        try:
+                            result = future.result()
+                            self._connect_merge_result(result)
+                        except Exception:
+                            logger.warning(
+                                "connect: skipping md file '%s' due to error",
+                                relpath,
+                                exc_info=True,
+                            )
+                            skipped_md.append(relpath)
+            else:
+                # sequential processing (default):
+                for i, (f, relpath) in enumerate(self._md_file_index.items(), 1):
+                    logger.debug(
+                        "connect: processing md file %d/%d: %s", i, n_md, relpath
                     )
-                except Exception:
-                    logger.warning(
-                        "connect: skipping md file '%s' due to error",
-                        relpath,
-                        exc_info=True,
-                    )
-                    skipped_md.append(relpath)
+                    try:
+                        result = _process_md_file_for_connect(
+                            self._dirpath,
+                            relpath,
+                            f,
+                            show_nested_tags,
+                            exclude_canvas,
+                        )
+                        self._connect_merge_result(result)
+                    except Exception:
+                        logger.warning(
+                            "connect: skipping md file '%s' due to error",
+                            relpath,
+                            exc_info=True,
+                        )
+                        skipped_md.append(relpath)
 
             # canvas content:
             # loop through canvas files:
@@ -610,44 +726,17 @@ class Vault:
 
         return self  # fluent
 
-    def _connect_update_based_on_new_relpath(
-        self, relpath: Path, *, note: str, show_nested_tags: bool
-    ):
-        """Individual file read & associated attrs update for the
-        connect method."""
-        exclude_canvas = not self._attachments
-
-        # MAIN file read:
-        front_matter, content = _get_md_front_matter_and_content(
-            self._dirpath / relpath
-        )
-        html = _get_html_from_md_content(content)
-        src_txt = get_source_text_from_html(html, remove_code=True)
-
-        # info from core text:
-        self._md_links_index[note] = _get_md_links_from_source_text(src_txt)
-        self._unique_md_links_index[note] = _get_unique_md_links_from_source_text(
-            src_txt
-        )
-        self._embedded_files_index[note] = (
-            _get_all_embedded_files_from_source_text(src_txt, remove_aliases=True)
-            # (aliases are redundant for connect method)
-        )
-        self._wikilinks_index[note] = _get_all_wikilinks_from_source_text(
-            src_txt, remove_aliases=True, exclude_canvas=exclude_canvas
-        )
-        self._unique_wikilinks_index[note] = _get_unique_wikilinks_from_source_text(
-            src_txt, remove_aliases=True, exclude_canvas=exclude_canvas
-        )
-        # info from html:
-        self._math_index[note] = _get_all_latex_from_html_content(html)
-        # split out front matter:
-        self._front_matter_index[note] = front_matter
-
-        # MORE file reads needed for extra info:
-        self._tags_index[note] = get_tags(
-            self._dirpath / relpath, show_nested=show_nested_tags
-        )
+    def _connect_merge_result(self, result: dict):
+        """Merge a single file's processed result into the indexes."""
+        note = result["note"]
+        self._md_links_index[note] = result["md_links"]
+        self._unique_md_links_index[note] = result["unique_md_links"]
+        self._embedded_files_index[note] = result["embedded_files"]
+        self._wikilinks_index[note] = result["wikilinks"]
+        self._unique_wikilinks_index[note] = result["unique_wikilinks"]
+        self._math_index[note] = result["math"]
+        self._front_matter_index[note] = result["front_matter"]
+        self._tags_index[note] = result["tags"]
 
     def _set_media_file_attrs(self):
         (
@@ -875,7 +964,7 @@ class Vault:
         self._nonexistent_notes = self._get_nonexistent_notes()
         self._isolated_notes = self._get_isolated_notes(graph=self._graph)
 
-    def gather(self, *, tags: list[str] = None):
+    def gather(self, *, tags: list[str] = None, workers: int = None):
         """gather the content of your notes so that all the plaintext is
         stored in one place for easy access.
 
@@ -896,21 +985,65 @@ class Vault:
                 their formatting in the final text.  For example, tags=[]
                 will remove all header formatting (e.g. '#', '##' chars)
                 and produces a one-line string.
+            workers (int, optional): number of threads to use for parallel
+                file processing.  Defaults to None, which uses the value
+                set at Vault initialisation.  Set to a positive integer
+                to override, e.g. ``workers=os.cpu_count()``.
         """
-        logger.info("Gathering text from %d md files", len(self._md_file_index))
+        workers = workers if workers is not None else self._workers
+        logger.info(
+            "Gathering text from %d md files (workers=%s)",
+            len(self._md_file_index),
+            workers,
+        )
         n_md = len(self._md_file_index)
         skipped = []
-        for i, (f, relpath) in enumerate(self._md_file_index.items(), 1):
-            logger.debug("gather: processing file %d/%d: %s", i, n_md, relpath)
-            try:
-                self._gather_update_based_on_new_relpath(relpath, note=f, tags=tags)
-            except Exception:
-                logger.warning(
-                    "gather: skipping file '%s' due to error",
-                    relpath,
-                    exc_info=True,
-                )
-                skipped.append(relpath)
+
+        if workers and workers > 1:
+            # parallel processing via process pool:
+            with ProcessPoolExecutor(max_workers=_cap_workers(workers)) as executor:
+                futures = {
+                    executor.submit(
+                        _process_md_file_for_gather,
+                        self._dirpath,
+                        relpath,
+                        f,
+                        tags,
+                    ): (f, relpath)
+                    for f, relpath in self._md_file_index.items()
+                }
+                for future in as_completed(futures):
+                    f, relpath = futures[future]
+                    try:
+                        result = future.result()
+                        self._gather_merge_result(result)
+                    except Exception:
+                        logger.warning(
+                            "gather: skipping file '%s' due to error",
+                            relpath,
+                            exc_info=True,
+                        )
+                        skipped.append(relpath)
+        else:
+            # sequential processing (default):
+            for i, (f, relpath) in enumerate(self._md_file_index.items(), 1):
+                logger.debug("gather: processing file %d/%d: %s", i, n_md, relpath)
+                try:
+                    result = _process_md_file_for_gather(
+                        self._dirpath,
+                        relpath,
+                        f,
+                        tags,
+                    )
+                    self._gather_merge_result(result)
+                except Exception:
+                    logger.warning(
+                        "gather: skipping file '%s' due to error",
+                        relpath,
+                        exc_info=True,
+                    )
+                    skipped.append(relpath)
+
         self._is_gathered = True
         if skipped:
             logger.warning(
@@ -922,20 +1055,11 @@ class Vault:
 
         return self  # fluent
 
-    def _gather_update_based_on_new_relpath(
-        self, relpath: Path, *, note: str, tags: list[str]
-    ):
-        """Individual file read & associated attrs update for the
-        gather method."""
-        # MAIN file read:
-        _, content = _get_md_front_matter_and_content(self._dirpath / relpath)
-        html = _get_html_from_md_content(content)
-        # (also remove LaTeX for source text:)
-        src_txt = get_source_text_from_html(html, remove_code=True, remove_math=True)
-
-        # 'source' text will not remove any content, but 'readable' will:
-        self._source_text_index[note] = src_txt
-        self._readable_text_index[note] = _get_readable_text_from_html(html, tags=tags)
+    def _gather_merge_result(self, result: dict):
+        """Merge a single file's processed result into the indexes."""
+        note = result["note"]
+        self._source_text_index[note] = result["source_text"]
+        self._readable_text_index[note] = result["readable_text"]
 
     def get_backlinks(self, note_name: str) -> list[str]:
         """Get backlinks for a note (given its name).
