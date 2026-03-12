@@ -131,7 +131,7 @@ def test_vault_get_properties_index(test_vault):
     index = test_vault.get_properties_index()
     assert 'basic_properties' in index
     assert 'frontmatter_style' in index
-    assert len(index) == 10  # All our test files should have properties
+    assert len(index) == 11  # All our test files should have properties
     assert index['basic_properties']['prop1'] == 'value1'
     assert index['frontmatter_style']['status'] == 'In Progress'
     assert index['inline_properties']['tags'] == ['tag1', 'tag2', 'tag3']
